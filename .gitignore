@@ -1,0 +1,4 @@
+.venv
+
+dataset/
+runs/detect/predict
