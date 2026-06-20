@@ -1,2 +1,3 @@
 - yolov8 Ultralytics
 - labelImg
+- speed_signs.yaml set dataset path

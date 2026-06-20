@@ -1,4 +1,4 @@
-path: C:/Users/Marko/Desktop/Rad AI/dataset
+path: C:\Users\Marko\Desktop\SpeedPredict\dataset
 train: images/train
 val: images/val
 test: images/test
