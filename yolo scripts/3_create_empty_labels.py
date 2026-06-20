@@ -1,6 +1,6 @@
 from pathlib import Path
-PROJECT_ROOT = Path(__file__).resolve().parent.parent   # script is in "yolo scripts/"
-DATASET = PROJECT_ROOT / "dataset"
+project_root = Path(__file__).resolve().parent.parent   # script is in "yolo scripts/"
+dataset = project_root / "dataset"
 
 # Splits you use
 splits = ["train", "val", "test"]
@@ -8,11 +8,9 @@ splits = ["train", "val", "test"]
 # Image extensions to scan
 image_exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
-root = Path("dataset")
-
 for split in splits:
-    img_dir = root / "images" / split
-    lbl_dir = root / "labels" / split
+    img_dir = dataset / "images" / split
+    lbl_dir = dataset / "labels" / split
 
     if not img_dir.exists():
         continue

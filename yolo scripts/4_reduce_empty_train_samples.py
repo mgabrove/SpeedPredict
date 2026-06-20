@@ -4,13 +4,15 @@ import shutil
 
 random.seed(42)
 
-root = Path(r"C:\Users\Marko\Desktop\Rad AI\dataset")
-train_img = root / "images" / "train"
-train_lbl = root / "labels" / "train"
+project_root = Path(__file__).resolve().parent.parent
+dataset = project_root / "dataset"
+
+train_img = dataset / "images" / "train"
+train_lbl = dataset / "labels" / "train"
 
 # Backup destinations
-backup_img = root / "images" / "train_empty_backup"
-backup_lbl = root / "labels" / "train_empty_backup"
+backup_img = dataset / "images" / "train_empty_backup"
+backup_lbl = dataset / "labels" / "train_empty_backup"
 
 backup_img.mkdir(parents=True, exist_ok=True)
 backup_lbl.mkdir(parents=True, exist_ok=True)
@@ -26,7 +28,7 @@ for img in train_img.iterdir():
 
     lbl = train_lbl / f"{img.stem}.txt"
     if not lbl.exists():
-        # if label missing, skip (your analyzer said none missing, but safe)
+        # if label missing, skip
         continue
 
     txt = lbl.read_text(encoding="utf-8", errors="ignore").strip()

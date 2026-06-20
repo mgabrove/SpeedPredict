@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-labelImg "$PROJECT_ROOT/dataset/images/NEW" \
-         "$PROJECT_ROOT/dataset/labels/predefined_classes.txt" \
-         "$PROJECT_ROOT/dataset/labels/NEW"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+project_root="$(cd "$script_dir/.." && pwd)"
+
+labelImg "$project_root/dataset/images/NEW" \
+         "$project_root/dataset/labels/predefined_classes.txt" \
+         "$project_root/dataset/labels/NEW"
+
+read -p "Press enter to continue"

@@ -2,15 +2,15 @@ from pathlib import Path
 from collections import Counter, defaultdict
 import math
 
-# ===== CONFIG =====
-labels_dir = Path(r"C:\Users\Marko\Desktop\Rad AI\dataset\labels\train")
-images_dir = Path(r"C:\Users\Marko\Desktop\Rad AI\dataset\images\train")  # used for missing-label check
+project_root = Path(__file__).resolve().parent.parent
+
+labels_dir = project_root / "dataset" / "labels" / "train"
+images_dir = project_root / "dataset" / "images" / "train"  # used for missing-label check
 
 class_names = ["30", "40", "50", "60", "70", "80"]
 num_classes = len(class_names)
 image_exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
-# ===== STATS =====
 class_counts = Counter()
 files_with_objects = 0
 empty_label_files = 0
@@ -25,7 +25,6 @@ box_widths = []
 box_heights = []
 box_areas = []
 
-# ===== HELPERS =====
 def is_float(s):
     try:
         float(s)
@@ -33,7 +32,6 @@ def is_float(s):
     except:
         return False
 
-# ===== CHECK LABEL FILES =====
 if not labels_dir.exists():
     raise FileNotFoundError(f"Labels directory not found: {labels_dir}")
 
@@ -88,7 +86,6 @@ for lf in label_files:
         box_heights.append(h)
         box_areas.append(w * h)
 
-# ===== MISSING LABELS FOR IMAGES =====
 missing_label_for_image = []
 if images_dir.exists():
     images = [p for p in images_dir.rglob("*") if p.suffix.lower() in image_exts]
@@ -97,7 +94,6 @@ if images_dir.exists():
         if not lbl.exists():
             missing_label_for_image.append(str(img))
 
-# ===== REPORT =====
 print("=" * 72)
 print("YOLO LABEL ANALYSIS REPORT")
 print("=" * 72)

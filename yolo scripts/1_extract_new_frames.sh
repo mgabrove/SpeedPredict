@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+project_root="$(cd "$script_dir/.." && pwd)"
 
-in_dir="$PROJECT_ROOT/dataset/videos"
-out_dir="$PROJECT_ROOT/dataset/images/NEW"
+in_dir="$project_root/dataset/videos"
+out_dir="$project_root/dataset/images/NEW"
 
 mkdir -p "$out_dir"
 
