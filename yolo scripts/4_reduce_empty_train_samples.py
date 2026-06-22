@@ -45,7 +45,7 @@ print(f"Empty images:     {empty_count}")
 print(f"Total:            {total}")
 
 # Choose target empty ratio in TRAIN after moving (0.4 to 0.5 is good)
-target_empty_ratio = 0.50
+target_empty_ratio = 0.30
 
 # E/(E+P)=r  =>  E = r*P/(1-r)
 desired_empty = int((target_empty_ratio * non_empty_count) / (1 - target_empty_ratio))

@@ -1,3 +1,5 @@
 - yolov8 Ultralytics
 - labelImg
 - speed_signs.yaml set dataset path
+
+- python "./yolo scripts/9_clip_extractor.py" --model runs/detect/train/weights/best.pt

@@ -7,7 +7,7 @@ project_root = Path(__file__).resolve().parent.parent
 labels_dir = project_root / "dataset" / "labels" / "train"
 images_dir = project_root / "dataset" / "images" / "train"  # used for missing-label check
 
-class_names = ["30", "40", "50", "60", "70", "80"]
+class_names = ["30", "40", "50", "60", "70", "80", "end_30"]
 num_classes = len(class_names)
 image_exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 

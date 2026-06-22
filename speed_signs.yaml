@@ -3,10 +3,12 @@ train: images/train
 val: images/val
 test: images/test
 
+nc: 7
 names:
-  0: 30
-  1: 40
-  2: 50
-  3: 60
-  4: 70
-  5: 80
+  0: "30"
+  1: "40"
+  2: "50"
+  3: "60"
+  4: "70"
+  5: "80"
+  6: "end_30"
