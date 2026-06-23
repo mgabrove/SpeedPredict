@@ -3,7 +3,7 @@ import argparse
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 from ultralytics import YOLO
@@ -18,29 +18,53 @@ class TrackState:
     cls_votes: Dict[int, float] = field(default_factory=dict)  # class_id -> conf-weighted votes
     conf_sum: float = 0.0
     conf_count: int = 0
+    max_conf: float = 0.0
     max_area: float = 0.0
     first_frame: int = -1
     last_frame: int = -1
     misses: int = 0
     frames_seen: int = 0
 
-    def add_obs(self, frame_idx: int, cls_id: int, conf: float, area: float):
+    # for optional center gating statistics
+    center_hits: int = 0
+
+    def add_obs(self, frame_idx: int, cls_id: int, conf: float, area: float, in_center_region: bool):
         if self.first_frame < 0:
             self.first_frame = frame_idx
         self.last_frame = frame_idx
         self.frames_seen += 1
+
         self.conf_sum += conf
         self.conf_count += 1
+        self.max_conf = max(self.max_conf, conf)
         self.max_area = max(self.max_area, area)
+
         self.cls_votes[cls_id] = self.cls_votes.get(cls_id, 0.0) + conf
         self.misses = 0
+
+        if in_center_region:
+            self.center_hits += 1
 
     @property
     def mean_conf(self) -> float:
         return self.conf_sum / max(1, self.conf_count)
 
+    @property
+    def total_vote(self) -> float:
+        return sum(self.cls_votes.values()) if self.cls_votes else 0.0
+
     def voted_class(self) -> int:
         return max(self.cls_votes.items(), key=lambda kv: kv[1])[0]
+
+    def dominance(self) -> float:
+        if not self.cls_votes:
+            return 0.0
+        winner_vote = max(self.cls_votes.values())
+        total = self.total_vote
+        return (winner_vote / total) if total > 0 else 0.0
+
+    def center_ratio(self) -> float:
+        return self.center_hits / max(1, self.frames_seen)
 
 
 @dataclass
@@ -50,13 +74,16 @@ class SignEvent:
     end_frame: int
     voted_cls: int
     mean_conf: float
+    max_conf: float
     frames_seen: int
     max_area: float
+    dominance: float
+    center_ratio: float
     score: float
 
 
 class SegmentWriter:
-    def __init__(self, clips_root: Path, video_stem: str, fps: float, size_wh):
+    def __init__(self, clips_root: Path, video_stem: str, fps: float, size_wh: Tuple[int, int]):
         self.clips_root = clips_root
         self.video_stem = video_stem
         self.fps = fps
@@ -124,6 +151,22 @@ def find_videos(folder: Path) -> List[Path]:
     return sorted([p for p in folder.iterdir() if p.is_file() and p.suffix in exts])
 
 
+def in_center_region(x1, y1, x2, y2, w, h, center_x_margin=0.45, center_y_margin=0.425) -> bool:
+    """
+    center_x_margin=0.45 means keep x-center in [0.05, 0.95]
+    center_y_margin=0.425 means keep y-center in [0.075, 0.925]
+    """
+    cx = 0.5 * (x1 + x2) / max(1.0, w)
+    cy = 0.5 * (y1 + y2) / max(1.0, h)
+
+    x_min = 0.5 - center_x_margin
+    x_max = 0.5 + center_x_margin
+    y_min = 0.5 - center_y_margin
+    y_max = 0.5 + center_y_margin
+
+    return (x_min <= cx <= x_max) and (y_min <= cy <= y_max)
+
+
 def process_video(model: YOLO, video_path: Path, clips_root: Path, args) -> Optional[dict]:
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -139,8 +182,8 @@ def process_video(model: YOLO, video_path: Path, clips_root: Path, args) -> Opti
     segment_writer = SegmentWriter(clips_root=clips_root, video_stem=video_path.stem, fps=fps, size_wh=(w, h))
 
     # Speed state
-    current_speed: Optional[str] = None        # None = unknown
-    pre_30_speed: Optional[str] = None         # speed before entering current 30 zone
+    current_speed: Optional[str] = None   # None = unknown
+    pre_30_speed: Optional[str] = None    # remembered speed before entering 30
     last_transition_frame = -10**9
 
     # Track management
@@ -164,11 +207,11 @@ def process_video(model: YOLO, video_path: Path, clips_root: Path, args) -> Opti
         frame_idx += 1
         frame = r.orig_img
 
-        # everyone gets one miss by default this frame
+        # everyone missed by default each frame
         for ts in active_tracks.values():
             ts.misses += 1
 
-        # update active tracks from this frame detections
+        # update tracks from detections
         if r.boxes is not None and len(r.boxes) > 0 and r.boxes.id is not None:
             ids = r.boxes.id.int().cpu().tolist()
             clss = r.boxes.cls.int().cpu().tolist()
@@ -179,36 +222,71 @@ def process_video(model: YOLO, video_path: Path, clips_root: Path, args) -> Opti
                 x1, y1, x2, y2 = xyxy
                 area = max(0.0, (x2 - x1) * (y2 - y1)) / float(max(1, w * h))
 
+                center_ok = in_center_region(
+                    x1, y1, x2, y2, w, h,
+                    center_x_margin=args.center_x_margin,
+                    center_y_margin=args.center_y_margin
+                )
+
                 if tid not in active_tracks:
                     active_tracks[tid] = TrackState(track_id=tid)
-                active_tracks[tid].add_obs(frame_idx=frame_idx, cls_id=int(cid), conf=float(conf), area=area)
 
-        # finalize tracks that disappeared long enough
+                active_tracks[tid].add_obs(
+                    frame_idx=frame_idx,
+                    cls_id=int(cid),
+                    conf=float(conf),
+                    area=area,
+                    in_center_region=center_ok
+                )
+
+        # finalize disappeared tracks
         finalized_events: List[SignEvent] = []
         remove_ids = []
 
         for tid, ts in active_tracks.items():
             if ts.misses > args.max_gap:
-                if ts.frames_seen >= args.min_frames and ts.mean_conf >= args.min_mean_conf:
+                # --- anti-ghost gating ---
+                passes = (
+                    ts.frames_seen >= args.min_frames
+                    and ts.mean_conf >= args.min_mean_conf
+                    and ts.max_conf >= args.min_peak_conf
+                    and ts.max_area >= args.min_max_area
+                    and ts.dominance() >= args.min_dominance
+                )
+
+                if args.use_center_gate:
+                    passes = passes and (ts.center_ratio() >= args.min_center_ratio)
+
+                if passes:
                     voted_cls = ts.voted_class()
-                    # combined score for "most likely sign" selection
-                    score = (0.5 * ts.mean_conf) + (0.3 * ts.max_area) + (0.2 * min(1.0, ts.frames_seen / 30.0))
+                    # weighted score for winner selection
+                    score = (
+                        0.40 * ts.mean_conf
+                        + 0.20 * ts.max_conf
+                        + 0.20 * ts.max_area
+                        + 0.20 * ts.dominance()
+                    )
+
                     finalized_events.append(SignEvent(
                         track_id=tid,
                         start_frame=ts.first_frame,
                         end_frame=ts.last_frame,
                         voted_cls=voted_cls,
                         mean_conf=ts.mean_conf,
+                        max_conf=ts.max_conf,
                         frames_seen=ts.frames_seen,
                         max_area=ts.max_area,
+                        dominance=ts.dominance(),
+                        center_ratio=ts.center_ratio(),
                         score=score
                     ))
+
                 remove_ids.append(tid)
 
         for tid in remove_ids:
             active_tracks.pop(tid, None)
 
-        # Apply at most one transition when sign(s) leave view
+        # apply at most one transition per cooldown window
         if finalized_events and (frame_idx - last_transition_frame) >= args.cooldown:
             winner = pick_authoritative_event(finalized_events)
             if winner is not None:
@@ -217,8 +295,8 @@ def process_video(model: YOLO, video_path: Path, clips_root: Path, args) -> Opti
                 prev_speed = current_speed
                 transition_type = "ignored"
 
+                # simplified 30/end_30 logic
                 if cls_name == "end_30":
-                    # End zone 30 only if currently in 30
                     if current_speed == "30":
                         current_speed = pre_30_speed
                         pre_30_speed = None
@@ -229,17 +307,13 @@ def process_video(model: YOLO, video_path: Path, clips_root: Path, args) -> Opti
                 elif cls_name in SPEED_CLASSES:
                     if cls_name == "30":
                         if current_speed == "30":
-                            # repeated 30 sign -> keep 30, do not overwrite pre_30_speed
                             transition_type = "repeat_30_keep"
                         else:
-                            # entering 30 zone
                             pre_30_speed = current_speed
                             current_speed = "30"
                             transition_type = "set_30"
                     else:
-                        # non-30 speed signs set speed directly
                         current_speed = cls_name
-                        # override clears pending 30-context
                         pre_30_speed = None
                         transition_type = "set_speed_non30"
 
@@ -256,8 +330,11 @@ def process_video(model: YOLO, video_path: Path, clips_root: Path, args) -> Opti
                         "start_frame": winner.start_frame,
                         "end_frame": winner.end_frame,
                         "mean_conf": winner.mean_conf,
+                        "max_conf": winner.max_conf,
                         "frames_seen": winner.frames_seen,
-                        "max_area": winner.max_area
+                        "max_area": winner.max_area,
+                        "dominance": winner.dominance,
+                        "center_ratio": winner.center_ratio
                     },
                     "transition_type": transition_type,
                     "prev_speed": prev_speed,
@@ -265,7 +342,6 @@ def process_video(model: YOLO, video_path: Path, clips_root: Path, args) -> Opti
                     "pre_30_speed": pre_30_speed
                 })
 
-        # always write frame to current segment
         segment_writer.write(frame)
 
     segment_writer.finalize(frame_idx)
@@ -280,7 +356,8 @@ def process_video(model: YOLO, video_path: Path, clips_root: Path, args) -> Opti
 
 
 def main():
-    parser = argparse.ArgumentParser("Extract speed-labeled clips from dataset/OLD videos")
+    parser = argparse.ArgumentParser("Extract speed-labeled clips from dataset/OLD videos with anti-ghost voting")
+
     parser.add_argument("--model", required=True, help="Path to trained weights (best.pt)")
     parser.add_argument("--input-dir", default="dataset/OLD videos")
     parser.add_argument("--output-dir", default="dataset/CLIPS")
@@ -289,16 +366,27 @@ def main():
     parser.add_argument("--conf", type=float, default=0.25)
     parser.add_argument("--iou", type=float, default=0.45)
 
-    # event robustness
+    # temporal robustness
     parser.add_argument("--max-gap", type=int, default=10, help="missed frames before track finalization")
-    parser.add_argument("--min-frames", type=int, default=6, help="minimum track length to accept sign event")
-    parser.add_argument("--min-mean-conf", type=float, default=0.45, help="minimum mean confidence for accepted event")
-    parser.add_argument("--cooldown", type=int, default=15, help="minimum frames between transitions")
+    parser.add_argument("--cooldown", type=int, default=20, help="minimum frames between accepted transitions")
+
+    # anti-ghost gates
+    parser.add_argument("--min-frames", type=int, default=8, help="minimum track length")
+    parser.add_argument("--min-mean-conf", type=float, default=0.55, help="minimum mean confidence")
+    parser.add_argument("--min-peak-conf", type=float, default=0.70, help="minimum peak confidence in track")
+    parser.add_argument("--min-max-area", type=float, default=0.0015, help="minimum max normalized bbox area")
+    parser.add_argument("--min-dominance", type=float, default=0.75, help="winner vote / total vote threshold")
+
+    # optional center-region gating
+    parser.add_argument("--use-center-gate", action="store_true", help="enable center-region reliability gate")
+    parser.add_argument("--min-center-ratio", type=float, default=0.6, help="fraction of obs inside center region")
+    parser.add_argument("--center-x-margin", type=float, default=0.45, help="center x half-width in normalized coords")
+    parser.add_argument("--center-y-margin", type=float, default=0.425, help="center y half-height in normalized coords")
+
     args = parser.parse_args()
 
     input_dir = Path(args.input_dir)
     output_dir = Path(args.output_dir)
-
     for folder in OUT_FOLDERS:
         (output_dir / folder).mkdir(parents=True, exist_ok=True)
 
@@ -313,6 +401,7 @@ def main():
         "input_dir": str(input_dir),
         "output_dir": str(output_dir),
         "model": args.model,
+        "params": vars(args),
         "videos_processed": 0,
         "videos": []
     }
