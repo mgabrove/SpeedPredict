@@ -167,6 +167,58 @@ def in_center_region(x1, y1, x2, y2, w, h, center_x_margin=0.45, center_y_margin
     return (x_min <= cx <= x_max) and (y_min <= cy <= y_max)
 
 
+def score_event(ts: TrackState) -> float:
+    return (
+        0.40 * ts.mean_conf
+        + 0.20 * ts.max_conf
+        + 0.20 * ts.max_area
+        + 0.20 * ts.dominance()
+    )
+
+
+def event_near_threshold(ts: TrackState, args) -> bool:
+    # "Near threshold" helper for suspicious report
+    return (
+        ts.frames_seen <= args.min_frames + args.near_margin_frames
+        or ts.mean_conf <= args.min_mean_conf + args.near_margin_conf
+        or ts.max_conf <= args.min_peak_conf + args.near_margin_conf
+        or ts.max_area <= args.min_max_area + args.near_margin_area
+        or ts.dominance() <= args.min_dominance + args.near_margin_dom
+        or (args.use_center_gate and ts.center_ratio() <= args.min_center_ratio + args.near_margin_center)
+    )
+
+
+def merge_short_segments(records: List[dict], fps: float, min_seconds: float) -> List[dict]:
+    """
+    Post-process segment records by merging short segments into previous segment
+    (if same speed, always merge; if different speed, still merge to reduce label flicker).
+    This only adjusts summary metadata, not mp4 files on disk.
+    """
+    if not records:
+        return records
+
+    min_frames = int(round(min_seconds * fps))
+    merged = [records[0].copy()]
+
+    for seg in records[1:]:
+        curr = seg.copy()
+        curr_len = curr["end_frame"] - curr["start_frame"] + 1
+
+        if curr_len < min_frames:
+            # merge short segment into previous
+            merged[-1]["end_frame"] = curr["end_frame"]
+            continue
+
+        # normal append
+        merged.append(curr)
+
+    # reindex
+    for i, seg in enumerate(merged):
+        seg["segment_index"] = i
+
+    return merged
+
+
 def process_video(model: YOLO, video_path: Path, clips_root: Path, args) -> Optional[dict]:
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -190,6 +242,8 @@ def process_video(model: YOLO, video_path: Path, clips_root: Path, args) -> Opti
     active_tracks: Dict[int, TrackState] = {}
 
     transitions = []
+    suspicious_transitions = []
+    skipped_same_speed_events = []
     frame_idx = -1
 
     results = model.track(
@@ -259,14 +313,6 @@ def process_video(model: YOLO, video_path: Path, clips_root: Path, args) -> Opti
 
                 if passes:
                     voted_cls = ts.voted_class()
-                    # weighted score for winner selection
-                    score = (
-                        0.40 * ts.mean_conf
-                        + 0.20 * ts.max_conf
-                        + 0.20 * ts.max_area
-                        + 0.20 * ts.dominance()
-                    )
-
                     finalized_events.append(SignEvent(
                         track_id=tid,
                         start_frame=ts.first_frame,
@@ -278,9 +324,8 @@ def process_video(model: YOLO, video_path: Path, clips_root: Path, args) -> Opti
                         max_area=ts.max_area,
                         dominance=ts.dominance(),
                         center_ratio=ts.center_ratio(),
-                        score=score
+                        score=score_event(ts)
                     ))
-
                 remove_ids.append(tid)
 
         for tid in remove_ids:
@@ -294,12 +339,11 @@ def process_video(model: YOLO, video_path: Path, clips_root: Path, args) -> Opti
 
                 prev_speed = current_speed
                 transition_type = "ignored"
+                candidate_new_speed = current_speed
 
-                # simplified 30/end_30 logic
                 if cls_name == "end_30":
                     if current_speed == "30":
-                        current_speed = pre_30_speed
-                        pre_30_speed = None
+                        candidate_new_speed = pre_30_speed
                         transition_type = "end_30_return"
                     else:
                         transition_type = "end_30_ignored"
@@ -308,55 +352,122 @@ def process_video(model: YOLO, video_path: Path, clips_root: Path, args) -> Opti
                     if cls_name == "30":
                         if current_speed == "30":
                             transition_type = "repeat_30_keep"
+                            candidate_new_speed = "30"
                         else:
-                            pre_30_speed = current_speed
-                            current_speed = "30"
+                            candidate_new_speed = "30"
                             transition_type = "set_30"
                     else:
-                        current_speed = cls_name
-                        pre_30_speed = None
+                        candidate_new_speed = cls_name
                         transition_type = "set_speed_non30"
 
-                new_folder = current_speed if current_speed is not None else "unknown"
-                segment_writer.switch_speed_folder(new_folder, frame_idx)
-                last_transition_frame = frame_idx
+                # suppress same-speed non-effective transitions (except keep-style logs)
+                is_effective_change = (candidate_new_speed != current_speed)
+                if (not is_effective_change) and transition_type in {"set_speed_non30", "end_30_return"}:
+                    skipped_same_speed_events.append({
+                        "frame": frame_idx,
+                        "winner_track_id": winner.track_id,
+                        "winner_class": cls_name,
+                        "winner_score": winner.score,
+                        "transition_type": "skipped_same_speed",
+                        "speed": current_speed,
+                    })
+                    # do not switch folder, do not update cooldown
+                else:
+                    # commit state changes
+                    if transition_type == "set_30" and is_effective_change:
+                        pre_30_speed = current_speed
+                        current_speed = "30"
 
-                transitions.append({
-                    "frame": frame_idx,
-                    "winner_track_id": winner.track_id,
-                    "winner_class": cls_name,
-                    "winner_score": winner.score,
-                    "event": {
-                        "start_frame": winner.start_frame,
-                        "end_frame": winner.end_frame,
-                        "mean_conf": winner.mean_conf,
-                        "max_conf": winner.max_conf,
-                        "frames_seen": winner.frames_seen,
-                        "max_area": winner.max_area,
-                        "dominance": winner.dominance,
-                        "center_ratio": winner.center_ratio
-                    },
-                    "transition_type": transition_type,
-                    "prev_speed": prev_speed,
-                    "new_speed": current_speed,
-                    "pre_30_speed": pre_30_speed
-                })
+                    elif transition_type == "repeat_30_keep":
+                        current_speed = "30"
+
+                    elif transition_type == "end_30_return" and is_effective_change:
+                        current_speed = candidate_new_speed
+                        pre_30_speed = None
+
+                    elif transition_type == "set_speed_non30" and is_effective_change:
+                        current_speed = candidate_new_speed
+                        pre_30_speed = None
+
+                    # for ignored / end_30_ignored nothing changes
+
+                    new_folder = current_speed if current_speed is not None else "unknown"
+                    segment_writer.switch_speed_folder(new_folder, frame_idx)
+                    last_transition_frame = frame_idx
+
+                    transitions.append({
+                        "frame": frame_idx,
+                        "winner_track_id": winner.track_id,
+                        "winner_class": cls_name,
+                        "winner_score": winner.score,
+                        "event": {
+                            "start_frame": winner.start_frame,
+                            "end_frame": winner.end_frame,
+                            "mean_conf": winner.mean_conf,
+                            "max_conf": winner.max_conf,
+                            "frames_seen": winner.frames_seen,
+                            "max_area": winner.max_area,
+                            "dominance": winner.dominance,
+                            "center_ratio": winner.center_ratio
+                        },
+                        "transition_type": transition_type,
+                        "prev_speed": prev_speed,
+                        "new_speed": current_speed,
+                        "pre_30_speed": pre_30_speed
+                    })
+
+                    # suspicious shortlist
+                    is_suspicious = (
+                        winner.score < args.suspicious_score
+                        or winner.center_ratio < args.suspicious_center_ratio
+                        or winner.frames_seen <= args.min_frames + args.near_margin_frames
+                        or winner.mean_conf <= args.min_mean_conf + args.near_margin_conf
+                        or winner.max_conf <= args.min_peak_conf + args.near_margin_conf
+                        or winner.max_area <= args.min_max_area + args.near_margin_area
+                        or winner.dominance <= args.min_dominance + args.near_margin_dom
+                    )
+                    if is_suspicious:
+                        suspicious_transitions.append({
+                            "frame": frame_idx,
+                            "winner_track_id": winner.track_id,
+                            "winner_class": cls_name,
+                            "winner_score": winner.score,
+                            "transition_type": transition_type,
+                            "prev_speed": prev_speed,
+                            "new_speed": current_speed,
+                            "event": {
+                                "start_frame": winner.start_frame,
+                                "end_frame": winner.end_frame,
+                                "mean_conf": winner.mean_conf,
+                                "max_conf": winner.max_conf,
+                                "frames_seen": winner.frames_seen,
+                                "max_area": winner.max_area,
+                                "dominance": winner.dominance,
+                                "center_ratio": winner.center_ratio
+                            }
+                        })
 
         segment_writer.write(frame)
 
     segment_writer.finalize(frame_idx)
 
+    original_segments = segment_writer.records
+    merged_segments = merge_short_segments(original_segments, fps=fps, min_seconds=args.min_segment_seconds)
+
     return {
         "video": str(video_path),
         "total_frames": total_frames,
         "fps": fps,
-        "segments": segment_writer.records,
-        "transitions": transitions
+        "segments": original_segments,
+        "segments_merged_preview": merged_segments,  # summary-only preview
+        "transitions": transitions,
+        "suspicious_transitions": suspicious_transitions,
+        "skipped_same_speed_events": skipped_same_speed_events
     }
 
 
 def main():
-    parser = argparse.ArgumentParser("Extract speed-labeled clips from dataset/OLD videos with anti-ghost voting")
+    parser = argparse.ArgumentParser("Extract speed-labeled clips from dataset/OLD videos with anti-ghost gating and sanitization helpers")
 
     parser.add_argument("--model", required=True, help="Path to trained weights (best.pt)")
     parser.add_argument("--input-dir", default="dataset/OLD videos")
@@ -370,11 +481,11 @@ def main():
     parser.add_argument("--max-gap", type=int, default=10, help="missed frames before track finalization")
     parser.add_argument("--cooldown", type=int, default=20, help="minimum frames between accepted transitions")
 
-    # anti-ghost gates
+    # anti-ghost gates (slightly stricter defaults)
     parser.add_argument("--min-frames", type=int, default=8, help="minimum track length")
-    parser.add_argument("--min-mean-conf", type=float, default=0.55, help="minimum mean confidence")
-    parser.add_argument("--min-peak-conf", type=float, default=0.70, help="minimum peak confidence in track")
-    parser.add_argument("--min-max-area", type=float, default=0.0015, help="minimum max normalized bbox area")
+    parser.add_argument("--min-mean-conf", type=float, default=0.60, help="minimum mean confidence")
+    parser.add_argument("--min-peak-conf", type=float, default=0.70, help="minimum peak confidence")
+    parser.add_argument("--min-max-area", type=float, default=0.0020, help="minimum max normalized bbox area")
     parser.add_argument("--min-dominance", type=float, default=0.75, help="winner vote / total vote threshold")
 
     # optional center-region gating
@@ -383,10 +494,26 @@ def main():
     parser.add_argument("--center-x-margin", type=float, default=0.45, help="center x half-width in normalized coords")
     parser.add_argument("--center-y-margin", type=float, default=0.425, help="center y half-height in normalized coords")
 
+    # suspicious transition report thresholds
+    parser.add_argument("--suspicious-score", type=float, default=0.64, help="mark transition suspicious below this score")
+    parser.add_argument("--suspicious-center-ratio", type=float, default=0.35, help="mark suspicious if center ratio below this")
+
+    # near-threshold margins
+    parser.add_argument("--near-margin-frames", type=int, default=2)
+    parser.add_argument("--near-margin-conf", type=float, default=0.03)
+    parser.add_argument("--near-margin-area", type=float, default=0.0004)
+    parser.add_argument("--near-margin-dom", type=float, default=0.05)
+    parser.add_argument("--near-margin-center", type=float, default=0.1)
+
+    # summary-only segment merge preview
+    parser.add_argument("--min-segment-seconds", type=float, default=4.0,
+                        help="summary preview: merge segments shorter than this duration into previous segment")
+
     args = parser.parse_args()
 
     input_dir = Path(args.input_dir)
     output_dir = Path(args.output_dir)
+
     for folder in OUT_FOLDERS:
         (output_dir / folder).mkdir(parents=True, exist_ok=True)
 
@@ -406,6 +533,9 @@ def main():
         "videos": []
     }
 
+    all_suspicious = []
+    all_skipped_same = []
+
     for i, vp in enumerate(videos, start=1):
         print(f"[{i}/{len(videos)}] Processing {vp.name} ...")
         result = process_video(model, vp, output_dir, args)
@@ -413,12 +543,38 @@ def main():
             summary["videos_processed"] += 1
             summary["videos"].append(result)
 
+            for s in result["suspicious_transitions"]:
+                s2 = dict(s)
+                s2["video"] = result["video"]
+                all_suspicious.append(s2)
+
+            for s in result["skipped_same_speed_events"]:
+                s2 = dict(s)
+                s2["video"] = result["video"]
+                all_skipped_same.append(s2)
+
     summary_path = output_dir / "clips_summary.json"
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2)
 
+    suspicious_path = output_dir / "suspicious_transitions.json"
+    with open(suspicious_path, "w", encoding="utf-8") as f:
+        json.dump({
+            "count": len(all_suspicious),
+            "items": sorted(all_suspicious, key=lambda x: x["winner_score"])
+        }, f, indent=2)
+
+    skipped_same_path = output_dir / "skipped_same_speed_events.json"
+    with open(skipped_same_path, "w", encoding="utf-8") as f:
+        json.dump({
+            "count": len(all_skipped_same),
+            "items": all_skipped_same
+        }, f, indent=2)
+
     print(f"[DONE] Processed {summary['videos_processed']} video(s).")
     print(f"[DONE] Summary saved to: {summary_path}")
+    print(f"[DONE] Suspicious transitions saved to: {suspicious_path}")
+    print(f"[DONE] Skipped same-speed events saved to: {skipped_same_path}")
 
 
 if __name__ == "__main__":

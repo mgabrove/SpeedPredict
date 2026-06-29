@@ -3,3 +3,16 @@
 - speed_signs.yaml set dataset path
 
 - python "./yolo scripts/9_clip_extractor.py" --model runs/detect/train/weights/best.pt
+- python "./yolo scripts/10_unpack_clips_to_frames.py" --clips-root "./dataset/CLIPS" --out-root "./dataset/ENV_FRAMES" --stride 10
+
+- python "./yolo scripts/11_train_env_speed.py" --data-root "./dataset/ENV_FRAMES" --epochs 25 --batch-size 64 --img-size 224
+
+
+
+python "./yolo scripts/10a_unpack_clips_to_frames.py" ^
+  --clips-root "./dataset/CLIPS" ^
+  --out-root "./dataset/ENV_FRAMES" ^
+  --auto-targets ^
+  --alpha-train 0.8 --alpha-val 0.9 --alpha-test 0.9 ^
+  --min-clips-train 3 --min-clips-val 1 --min-clips-test 1
+
